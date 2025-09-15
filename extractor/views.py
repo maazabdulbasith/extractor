@@ -1,5 +1,8 @@
 import os
 import tempfile
+import logging
+from decimal import Decimal
+from django.db import transaction
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -9,63 +12,82 @@ from .pdf_extractor import extract_text_from_pdf
 from .text_parser import parse_bank_statement
 from .models import PDFUpload, Transaction
 
+logger = logging.getLogger(__name__)
+
 class PDFUploadView(GenericAPIView):
     serializer_class = PDFUploadSerializer
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request):
         serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            pdf_file = serializer.validated_data['file']
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-            # Save temporarily
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            temp_path = temp_file.name
+        pdf_file = serializer.validated_data['file']
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        temp_path = temp_file.name
+        try:
+            with open(temp_path, 'wb+') as dest:
+                for chunk in pdf_file.chunks():
+                    dest.write(chunk)
+
+            extracted_text = extract_text_from_pdf(temp_path)
+
             try:
-                with open(temp_path, 'wb+') as dest:
-                    for chunk in pdf_file.chunks():
-                        dest.write(chunk)
+                parsed = parse_bank_statement(extracted_text)
+            except Exception:
+                parsed = []
 
-                # Step 1: Extract text
-                extracted_text = extract_text_from_pdf(temp_path)
-
-                # Step 2: Parse into transactions (best-effort)
-                try:
-                    parsed = parse_bank_statement(extracted_text)
-                except Exception:
-                    parsed = []
-
-                # Step 3: Save PDF upload record (uses file_name field)
+            with transaction.atomic():
                 pdf_record = PDFUpload.objects.create(file_name=getattr(pdf_file, 'name', 'uploaded.pdf'))
 
-                # Step 4: Save each transaction
-                created_txns = []
+                transactions_to_create = []
                 for txn in parsed:
-                    created = Transaction.objects.create(
-                        pdf=pdf_record,
-                        date=txn['date'],
-                        narration=txn['narration'],
-                        debit=txn.get('debit') or None,
-                        credit=txn.get('credit') or None,
-                        balance=txn.get('balance') or None,
+                    debit = txn.get('debit')
+                    credit = txn.get('credit')
+                    balance = txn.get('balance')
+                    transactions_to_create.append(
+                        Transaction(
+                            pdf=pdf_record,
+                            date=txn['date'],
+                            narration=txn['narration'],
+                            debit=Decimal(str(debit)) if debit not in (None, 0, 0.0, "") else None,
+                            credit=Decimal(str(credit)) if credit not in (None, 0, 0.0, "") else None,
+                            balance=Decimal(str(balance)) if balance not in (None, 0, 0.0, "") else None,
+                        )
                     )
-                    created_txns.append(created)
+                if transactions_to_create:
+                    Transaction.objects.bulk_create(transactions_to_create)
 
-                # Step 5: Return both raw text and serialized transactions
-                return Response({
-                    "text": extracted_text,
-                    "transactions": TransactionSerializer(created_txns, many=True).data,
-                    "transaction_count": len(created_txns)
-                }, status=status.HTTP_200_OK)
+            saved_txns = Transaction.objects.filter(pdf=pdf_record).order_by('id')
 
-            except Exception as e:
-                return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            finally:
-                # Cleanup temp file
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except Exception:
-                    pass
-        
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            return Response({
+                "text": extracted_text,
+                "transactions": TransactionSerializer(saved_txns, many=True).data,
+                "transaction_count": saved_txns.count(),
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Failed processing PDF upload")
+            message = str(e)
+            error_type = e.__class__.__name__
+            hint = None
+            lower = message.lower()
+            if "poppler" in lower:
+                hint = "Install Poppler and set POPPLER_PATH or add poppler bin to PATH."
+            elif "tesseract" in lower:
+                hint = "Install Tesseract OCR and add to PATH, or set pytesseract.pytesseract.tesseract_cmd."
+            elif "could not connect to server" in lower or "connection refused" in lower:
+                hint = "Ensure PostgreSQL is running and credentials in settings.py are correct."
+            return Response({
+                "error": message,
+                "error_type": error_type,
+                **({"hint": hint} if hint else {})
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
