@@ -11,6 +11,7 @@ from .serializers import PDFUploadSerializer, TransactionSerializer
 from .pdf_extractor import extract_text_from_pdf
 from .text_parser import parse_bank_statement
 from .models import PDFUpload, Transaction
+from .csv_extractor import extract_text_from_csv
 
 logger = logging.getLogger(__name__)
 
@@ -25,19 +26,34 @@ class PDFUploadView(GenericAPIView):
 
         pdf_file = serializer.validated_data['file']
 
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        filename = getattr(pdf_file, 'name', '') or ''
+        content_type = getattr(pdf_file, 'content_type', None)
+        _, ext = os.path.splitext(filename)
+        ext = ext.lower()
+
+        allowed_csv_types = {"text/csv", "application/csv", "application/vnd.ms-excel"}
+        is_csv = (ext == '.csv') or (content_type in allowed_csv_types)
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.csv' if is_csv else '.pdf')
         temp_path = temp_file.name
         try:
             with open(temp_path, 'wb+') as dest:
                 for chunk in pdf_file.chunks():
                     dest.write(chunk)
 
-            extracted_text = extract_text_from_pdf(temp_path)
-
-            try:
-                parsed = parse_bank_statement(extracted_text)
-            except Exception:
-                parsed = []
+            if is_csv:
+                try:
+                    with open(temp_path, 'rb') as f:
+                        parsed = extract_text_from_csv(f)
+                except Exception:
+                    parsed = []
+                extracted_text = "CSV Upload"
+            else:
+                extracted_text = extract_text_from_pdf(temp_path)
+                try:
+                    parsed = parse_bank_statement(extracted_text)
+                except Exception:
+                    parsed = []
 
             with transaction.atomic():
                 pdf_record = PDFUpload.objects.create(file_name=getattr(pdf_file, 'name', 'uploaded.pdf'))
